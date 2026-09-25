@@ -606,49 +606,42 @@ app.post("/deleteaddress", async (req, res) => {
 
 
 //add to cart ---------------------------------
+// Add To Cart
 app.post("/addtocart", async (req, res) => {
+    try {
+        let product = req.body;
 
-    let product = req.body;
-
-    let already = await mycart.findOne({
-        productId: product._id
-    });
-
-    if (already) {
-
-        return res.json({
-            status: false,
-            message: "Already Added"
+        // ✅ Check by productId + email/userId
+        let already = await mycart.findOne({
+            productId: product._id,
+            email: product.email // Ensure email is sent from frontend
         });
 
+        if (already) {
+            return res.json({
+                status: false,
+                message: "Already Added"
+            });
+        }
+
+        let cart = new mycart({
+            productId: product._id,
+            email: product.email,
+            Title: product.Title,
+            Category: product.Category,
+            image: product.image,
+            Weight: product.Weight,
+            SalePrice: product.SalePrice,
+            RegularPrice: product.RegularPrice,
+            quantity: 1
+        });
+
+        await cart.save();
+
+        res.json({ status: true });
+    } catch (err) {
+        res.json({ status: false, message: err.message });
     }
-
-    let cart = new mycart({
-
-        productId: product._id,
-
-        Title: product.Title,
-
-        Category: product.Category,
-
-        image: product.image,
-
-        Weight: product.Weight,
-
-        SalePrice: product.SalePrice,
-
-        RegularPrice: product.RegularPrice,
-
-        quantity: 1
-
-    });
-
-    await cart.save();
-
-    res.json({
-        status: true
-    });
-
 });
 
 
@@ -691,97 +684,100 @@ app.post("/deleteshopcart", async (req, res) => {
     }
 });
 
-// wishlist page ---------------
-
+// Wishlist Page ------------------
 const mywishlist = require("./model/Wishlist");
 
+// Add to Wishlist
 app.post("/addwishlist", async (req, res) => {
+    try {
+        let product = req.body;
 
-    let product = req.body;
-
-    let already = await mywishlist.findOne({
-        productId: product._id
-    });
-
-    if (already) {
-        return res.json({
-            status: false,
-            msg: "Already Added"
+        // ✅ FIX: email aur productId DONO se check karein
+        let already = await mywishlist.findOne({
+            productId: product._id,
+            email: product.email
         });
-    }
 
-    let wishlist = await mywishlist.insertOne({
+        if (already) {
+            return res.json({
+                status: false,
+                msg: "Already Added"
+            });
+        }
 
-        productId: product._id,
+        // ✅ FIX: Standard Mongoose creation method
+        let wishlist = new mywishlist({
+            productId: product._id,
+            Title: product.Title,
+            Category: product.Category,
+            Weight: product.Weight,
+            image: product.image,
+            SalePrice: product.SalePrice,
+            RegularPrice: product.RegularPrice,
+            email: product.email,
+            status: product.status
+        });
 
-        Title: product.Title,
+        await wishlist.save();
 
-        Category: product.Category,
-
-        Weight: product.Weight,
-
-        image: product.image,
-
-        SalePrice: product.SalePrice,
-
-        RegularPrice: product.RegularPrice,
-        email: product.email,
-
-        status: product.status
-
-
-    });
-
-    await wishlist.save();
-
-    res.json({
-        status: true
-    });
-
-});
-
-
-app.post("/wishlist", async (req, res) => {
-
-    let result = await mywishlist.find({ email: req.body.email });
-
-    res.json({
-        status: true,
-        mywishlist: result
-    });
-
-});
-
-
-app.post("/deletewishlist", async (req, res) => {
-
-    let result = await mywishlist.findOneAndDelete({
-        _id: req.body._id,
-        email: req.body.email
-    });
-
-    if (result) {
         res.json({
             status: true
         });
-    } else {
+    } catch (err) {
         res.json({
-            status: false
+            status: false,
+            msg: err.message
         });
     }
-
 });
 
+// Get User Specific Wishlist
+app.post("/wishlist", async (req, res) => {
+    try {
+        let result = await mywishlist.find({ email: req.body.email });
+        res.json({
+            status: true,
+            mywishlist: result
+        });
+    } catch (err) {
+        res.json({
+            status: false,
+            msg: err.message
+        });
+    }
+});
+
+// Delete Wishlist Item
+app.post("/deletewishlist", async (req, res) => {
+    try {
+        let result = await mywishlist.findOneAndDelete({
+            _id: req.body._id,
+            email: req.body.email
+        });
+
+        if (result) {
+            res.json({ status: true });
+        } else {
+            res.json({ status: false });
+        }
+    } catch (err) {
+        res.json({ status: false });
+    }
+});
+
+// ✅ FIX: Wishlist Count (Filtered by User Email)
+app.post("/wishlistcount", async (req, res) => {
+    try {
+        let count = await mywishlist.countDocuments({ email: req.body.email });
+        res.json({
+            status: true,
+            count: count
+        });
+    } catch (err) {
+        res.json({ status: false, count: 0 });
+    }
+});
 // navbar----------------------------
-// wishlist count
-app.get("/wishlistcount", async (req, res) => {
-    let count = await mywishlist.countDocuments();
-
-    res.json({
-        status: true,
-        count: count
-    });
-});
 
 // cart count
 app.get("/cartcount", async (req, res) => {
