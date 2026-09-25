@@ -780,13 +780,62 @@ app.post("/wishlistcount", async (req, res) => {
 // navbar----------------------------
 
 // cart count
-app.get("/cartcount", async (req, res) => {
-    let count = await mycart.countDocuments();
 
-    res.json({
-        status: true,
-        count: count
-    });
+
+// ✅ Cart Count (Filtered by Logged-in User)
+app.post("/cartcount", async (req, res) => {
+    try {
+        const { email } = req.body;
+
+        if (!email) {
+            return res.json({ status: false, count: 0 });
+        }
+
+        // Distinct items count
+        let count = await mycart.countDocuments({ email: email });
+
+        res.json({
+            status: true,
+            count: count
+        });
+    } catch (err) {
+        res.json({ status: false, count: 0 });
+    }
+});
+
+// ✅ Delete Cart Item (With User Verification)
+app.post("/deletecart", async (req, res) => {
+    try {
+        let result = await mycart.findOneAndDelete({
+            _id: req.body._id,
+            email: req.body.email
+        });
+
+        if (result) {
+            res.json({ status: true });
+        } else {
+            res.json({ status: false });
+        }
+    } catch (err) {
+        res.json({ status: false });
+    }
+});
+
+
+// Alternative: Agar Total Quantity sum karke dikhani ho
+app.post("/cartcount", async (req, res) => {
+    try {
+        const { email } = req.body;
+        const result = await mycart.aggregate([
+            { $match: { email: email } },
+            { $group: { _id: null, totalQty: { $sum: "$quantity" } } }
+        ]);
+
+        let total = result.length > 0 ? result[0].totalQty : 0;
+        res.json({ status: true, count: total });
+    } catch (err) {
+        res.json({ status: false, count: 0 });
+    }
 });
 
 
