@@ -1,287 +1,623 @@
-const bodyParser = require("body-parser")
-const { default: mongoose } = require("mongoose")
-cors = require("cors")
+require("dotenv").config();
 
+const express = require("express");
+const mongoose = require("mongoose");
+const cors = require("cors");
+const bcrypt = require("bcryptjs");
+const jwt = require("jsonwebtoken");
+const rateLimit = require("express-rate-limit");
+const crypto = require("crypto");
 
-express = require("express")
-
-app = express()
-
-app.listen(8080, () => {
-    console.log("backend start")
-})
-
-// cors-------------
-app.use(cors())
-
-
-
-
-// bodyparser-----------------
-app.use(bodyParser.json())
-app.use(bodyParser.urlencoded())
-
-mongoose.connect("mongodb://shyam:86Shyam2004@ac-gnvigvq-shard-00-00.i3koajm.mongodb.net:27017,ac-gnvigvq-shard-00-01.i3koajm.mongodb.net:27017,ac-gnvigvq-shard-00-02.i3koajm.mongodb.net:27017/freshcart?ssl=true&replicaSet=atlas-12agm2-shard-0&authSource=admin&appName=Cluster0&compressors=zlib").then(() => console.log("Database Connected"))
-
-// schema--------------------
-
-
-const myusers = require("./model/Signup")
-const mycategory = require("./model/Addcategory")
-const myproducts = require("./model/Addproduct")
-
+// Models
+const myusers = require("./model/Signup");
+const mycategory = require("./model/Addcategory");
+const myproducts = require("./model/Addproduct");
 const myaddress = require("./model/Address");
-
 const mycart = require("./model/Cart");
+const mywishlist = require("./model/Wishlist");
+const myreview = require("./model/Review");
+const mypayment = require("./model/Payment");
+const myorder = require("./model/Order");
+const Vendor = require("./model/Vendor");
 
+const app = express();
 
-//  signup------------------
+// ==========================================
+// Middleware Configuration
+// ==========================================
 
-app.post("/signup", async (req, res) => {
-    let b = req.body.alldata
-    let a = await myusers.insertOne({
-        "firstname": b.firstname,
-        "lastname": b.lastname,
-        "email": b.email,
-        "password": b.password
-    })
+// CORS
+app.use(
+  cors({
+    origin: process.env.FRONTEND_URL || "*",
+    credentials: true
+  })
+);
 
+// Body Parsers
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
 
-    let result = await a.save()
-    if (result) {
-        res.json({
-            status: true
-        })
-    }
-    else {
-        res.json({
-            status: false
-        })
-    }
-})
+// Database Connection
+mongoose
+  .connect(process.env.MONGO_URI)
+  .then(() => console.log("Database Connected"))
+  .catch((err) => console.error("Database connection error:", err));
 
-
-// signin ------------------------------
-
-
-
-
-app.post("/signin", async (req, res) => {
-    let b = req.body.signindata
-    let a = await myusers.findOne({
-        "email": b.email,
-        "password": b.password
-    })
-
-    if (a) {
-
-        res.json({
-            status: true,
-            user: a
-        })
-    }
-    else {
-        res.json({
-            status: false
-        })
-    }
-})
-
-// user update --------------
-app.post("/updateuser", async (req, res) => {
-
-    let b = req.body.userdata;
-
-
-    let emailExists = await myusers.findOne({
-        email: b.email,
-        _id: { $ne: b._id }
-    });
-
-    if (emailExists) {
-        return res.json({
-            status: false,
-
-        });
-    }
-
-    let result = await myusers.findByIdAndUpdate(
-        b._id,
-        {
-            firstname: b.firstname,
-            lastname: b.lastname,
-            email: b.email,
-            phone: b.phone
-        },
-        { new: true }
-    );
-
-    if (result) {
-        res.json({
-            status: true,
-            user: result
-        });
-    } else {
-        res.json({
-            status: false
-        });
-    }
+// Rate Limiter for Authentication routes
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 15, // Limit each IP to 15 requests per window
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: {
+    status: false,
+    message: "Too many requests from this IP, please try again after 15 minutes."
+  }
 });
 
-// password update -------------------
-app.post("/updatepassword", async (req, res) => {
+// ==========================================
+// Authentication & Authorization Middlewares
+// ==========================================
 
-    let data = req.body;
+const authMiddleware = async (req, res, next) => {
+  try {
+    const authHeader = req.headers.authorization || req.headers.Authorization;
+    if (!authHeader || !authHeader.startsWith("Bearer ")) {
+      return res.status(401).json({
+        status: false,
+        message: "Unauthorized: Missing or invalid token format"
+      });
+    }
 
-    let user = await myusers.findOne({
-        _id: data.id,
-        password: data.currentPassword
+    const token = authHeader.split(" ")[1];
+    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+    req.user = decoded;
+    next();
+  } catch (err) {
+    return res.status(401).json({
+      status: false,
+      message: "Unauthorized: Invalid or expired token"
     });
+  }
+};
+
+const adminMiddleware = (req, res, next) => {
+  if (!req.user || !req.user.isAdmin) {
+    return res.status(403).json({
+      status: false,
+      message: "Forbidden: Admin access required"
+    });
+  }
+  next();
+};
+
+// ==========================================
+// User Authentication & Management Routes
+// ==========================================
+
+// User Signup
+app.post("/signup", authLimiter, async (req, res, next) => {
+  try {
+    const data = req.body.alldata || req.body;
+    const { firstname, lastname, email, password, phone } = data;
+
+    if (!firstname || !lastname || !email || !password) {
+      return res.status(400).json({
+        status: false,
+        message: "Firstname, lastname, email, and password are required"
+      });
+    }
+
+    const normalizedEmail = email.toLowerCase().trim();
+    const existingUser = await myusers.findOne({ email: normalizedEmail });
+    if (existingUser) {
+      return res.status(400).json({
+        status: false,
+        message: "Email already registered"
+      });
+    }
+
+    const hashedPassword = await bcrypt.hash(password, 10);
+    const newUser = new myusers({
+      firstname: firstname.trim(),
+      lastname: lastname.trim(),
+      email: normalizedEmail,
+      password: hashedPassword,
+      phone: phone ? phone.trim() : "",
+      isAdmin: false
+    });
+
+    await newUser.save();
+
+    return res.status(201).json({
+      status: true,
+      message: "User registered successfully"
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// User Signin
+app.post("/signin", authLimiter, async (req, res, next) => {
+  try {
+    const data = req.body.signindata || req.body;
+    const { email, password } = data;
+
+    if (!email || !password) {
+      return res.status(400).json({
+        status: false,
+        message: "Email and password are required"
+      });
+    }
+
+    const normalizedEmail = email.toLowerCase().trim();
+    const user = await myusers.findOne({ email: normalizedEmail });
     if (!user) {
-
-        return res.json({
-
-            status: false,
-
-            msg: "Current password incorrect"
-
-        });
-
+      return res.status(401).json({
+        status: false,
+        message: "Invalid email or password"
+      });
     }
 
-    await myusers.findByIdAndUpdate(
+    const isMatch = await bcrypt.compare(password, user.password);
+    if (!isMatch) {
+      return res.status(401).json({
+        status: false,
+        message: "Invalid email or password"
+      });
+    }
 
-        data.id,
+    const userPayload = {
+      _id: user._id,
+      email: user.email,
+      firstname: user.firstname,
+      lastname: user.lastname,
+      phone: user.phone || "",
+      isAdmin: Boolean(user.isAdmin)
+    };
 
-        {
-
-            password: data.newPassword
-
-        }
-
-    );
-
-    res.json({
-
-        status: true
-
+    const token = jwt.sign(userPayload, process.env.JWT_SECRET, {
+      expiresIn: "7d"
     });
 
+    return res.status(200).json({
+      status: true,
+      token: token,
+      user: userPayload
+    });
+  } catch (err) {
+    next(err);
+  }
 });
 
-// Delete Logged In User
-app.post("/deleteaccount", async (req, res) => {
+// Update User Profile
+app.post("/updateuser", authMiddleware, async (req, res, next) => {
+  try {
+    const b = req.body.userdata || req.body;
+    const targetUserId = req.user.isAdmin && b._id ? b._id : req.user._id;
 
+    if (b.email) {
+      const normalizedEmail = b.email.toLowerCase().trim();
+      const emailExists = await myusers.findOne({
+        email: normalizedEmail,
+        _id: { $ne: targetUserId }
+      });
 
-    let result = await myusers.findOneAndDelete({
-        "_id": req.body._id
+      if (emailExists) {
+        return res.status(400).json({
+          status: false,
+          message: "Email already in use by another account"
+        });
+      }
+    }
+
+    const updateFields = {};
+    if (b.firstname !== undefined) updateFields.firstname = b.firstname.trim();
+    if (b.lastname !== undefined) updateFields.lastname = b.lastname.trim();
+    if (b.email !== undefined) updateFields.email = b.email.toLowerCase().trim();
+    if (b.phone !== undefined) updateFields.phone = b.phone;
+
+    const result = await myusers
+      .findByIdAndUpdate(targetUserId, updateFields, { new: true })
+      .select("-password -passwordResetToken -passwordResetExpiry");
+
+    if (result) {
+      return res.status(200).json({
+        status: true,
+        user: result
+      });
+    } else {
+      return res.status(404).json({
+        status: false,
+        message: "User not found"
+      });
+    }
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Update Password
+app.post("/updatepassword", authMiddleware, async (req, res, next) => {
+  try {
+    const data = req.body;
+    const { currentPassword, newPassword } = data;
+    const targetUserId = req.user._id;
+
+    if (!currentPassword || !newPassword) {
+      return res.status(400).json({
+        status: false,
+        msg: "Current password and new password are required"
+      });
+    }
+
+    const user = await myusers.findById(targetUserId);
+    if (!user) {
+      return res.status(404).json({
+        status: false,
+        msg: "User not found"
+      });
+    }
+
+    const isMatch = await bcrypt.compare(currentPassword, user.password);
+    if (!isMatch) {
+      return res.status(400).json({
+        status: false,
+        msg: "Current password incorrect"
+      });
+    }
+
+    const hashedNewPassword = await bcrypt.hash(newPassword, 10);
+    await myusers.findByIdAndUpdate(targetUserId, {
+      password: hashedNewPassword
     });
 
+    return res.status(200).json({
+      status: true,
+      message: "Password updated successfully"
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Delete Logged In User Account & Associated Data
+app.post("/deleteaccount", authMiddleware, async (req, res, next) => {
+  try {
+    const targetUserId = req.user.isAdmin && req.body._id ? req.body._id : req.user._id;
+    const user = await myusers.findById(targetUserId);
+
+    if (!user) {
+      return res.status(404).json({
+        status: false,
+        message: "User not found"
+      });
+    }
+
+    const userEmail = user.email;
+
+    // Delete user document
+    await myusers.findByIdAndDelete(targetUserId);
+
+    // Delete associated cart, wishlist, orders, and addresses
+    await mycart.deleteMany({ email: userEmail });
+    await mywishlist.deleteMany({ email: userEmail });
+    await myorder.deleteMany({
+      $or: [{ userId: targetUserId.toString() }, { email: userEmail }]
+    });
+    await myaddress.deleteMany({ userid: targetUserId.toString() });
+
+    return res.status(200).json({
+      status: true,
+      message: "Account and associated data deleted successfully"
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Admin: Get All Users / Customers
+app.get("/allusers", authMiddleware, adminMiddleware, async (req, res, next) => {
+  try {
+    const users = await myusers
+      .find()
+      .select("-password -passwordResetToken -passwordResetExpiry")
+      .sort({ _id: -1 });
+
+    return res.status(200).json({
+      status: true,
+      myallusers: users
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Admin: Delete Customer
+app.post("/deletecustomer", authMiddleware, adminMiddleware, async (req, res, next) => {
+  try {
+    const customerId = req.body.dltcus?._id || req.body._id;
+    if (!customerId) {
+      return res.status(400).json({
+        status: false,
+        message: "Customer ID is required"
+      });
+    }
+
+    const customer = await myusers.findById(customerId);
+    if (!customer) {
+      return res.status(404).json({
+        status: false,
+        message: "Customer not found"
+      });
+    }
+
+    await myusers.findByIdAndDelete(customerId);
+    await mycart.deleteMany({ email: customer.email });
+    await mywishlist.deleteMany({ email: customer.email });
+    await myaddress.deleteMany({ userid: customerId.toString() });
+
+    return res.status(200).json({
+      status: true,
+      message: "Customer deleted successfully"
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Forgot Password - Generate Reset Token
+app.post("/forgetpass", authLimiter, async (req, res, next) => {
+  try {
+    const email = (req.body.forgetpass?.email || req.body.email || "").toLowerCase().trim();
+    if (!email) {
+      return res.status(400).json({
+        status: false,
+        message: "Email is required"
+      });
+    }
+
+    const user = await myusers.findOne({ email });
+    if (!user) {
+      return res.status(404).json({
+        status: false,
+        message: "No user found with this email"
+      });
+    }
+
+    const resetToken = crypto.randomBytes(32).toString("hex");
+    const hashedToken = await bcrypt.hash(resetToken, 10);
+    const expiryDate = new Date(Date.now() + 15 * 60 * 1000); // 15 minutes
+
+    user.passwordResetToken = hashedToken;
+    user.passwordResetExpiry = expiryDate;
+    await user.save();
+
+    // Log note for mock email delivery
+    console.log(`[AUTH] Password reset token generated for ${email}: ${resetToken}`);
+
+    return res.status(200).json({
+      status: true,
+      message: "Password reset token generated (valid for 15 minutes)",
+      token: resetToken
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Reset Password - Verify Token and Update Password
+app.post("/resetpassword", authLimiter, async (req, res, next) => {
+  try {
+    const { token, email, newPassword } = req.body;
+    if (!token || !email || !newPassword) {
+      return res.status(400).json({
+        status: false,
+        message: "Token, email, and newPassword are required"
+      });
+    }
+
+    const normalizedEmail = email.toLowerCase().trim();
+    const user = await myusers.findOne({ email: normalizedEmail });
+
+    if (!user || !user.passwordResetToken || !user.passwordResetExpiry) {
+      return res.status(400).json({
+        status: false,
+        message: "Invalid or expired password reset request"
+      });
+    }
+
+    if (new Date() > new Date(user.passwordResetExpiry)) {
+      user.passwordResetToken = null;
+      user.passwordResetExpiry = null;
+      await user.save();
+      return res.status(400).json({
+        status: false,
+        message: "Password reset token has expired"
+      });
+    }
+
+    const isMatch = await bcrypt.compare(token, user.passwordResetToken);
+    if (!isMatch) {
+      return res.status(400).json({
+        status: false,
+        message: "Invalid password reset token"
+      });
+    }
+
+    const hashedPassword = await bcrypt.hash(newPassword, 10);
+    user.password = hashedPassword;
+    user.passwordResetToken = null;
+    user.passwordResetExpiry = null;
+    await user.save();
+
+    return res.status(200).json({
+      status: true,
+      message: "Password reset successful"
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ==========================================
+// Category Management Routes
+// ==========================================
+
+// Admin: Add Category
+app.post("/category", authMiddleware, adminMiddleware, async (req, res, next) => {
+  try {
+    const b = req.body.categoryvalue || req.body;
+    const categoryDoc = new mycategory({
+      image: b.image,
+      categoryName: b.categoryName,
+      slug: b.slug,
+      date: b.date,
+      Description: b.Description,
+      Category: b.Category,
+      status: b.status,
+      metaTitle: b.metaTitle,
+      MetaDescription: b.MetaDescription
+    });
+
+    const result = await categoryDoc.save();
+    return res.status(201).json({
+      status: true,
+      category: result
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Public: Get All Categories
+app.get("/AllCategory", async (req, res, next) => {
+  try {
+    const a = await mycategory.find().sort({ _id: -1 });
+    return res.status(200).json({
+      status: true,
+      myallcategory: a
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Admin: Update Category
+app.post("/updatecategory", authMiddleware, adminMiddleware, async (req, res, next) => {
+  try {
+    const b = req.body.categoryvalue || req.body;
+    const result = await mycategory.findByIdAndUpdate(
+      b._id,
+      {
+        $set: {
+          image: b.image,
+          categoryName: b.categoryName,
+          slug: b.slug,
+          date: b.date,
+          Description: b.Description,
+          Category: b.Category,
+          status: b.status,
+          metaTitle: b.metaTitle,
+          MetaDescription: b.MetaDescription
+        }
+      },
+      { new: true }
+    );
+
     if (result) {
-        res.json({
-            status: true
-        });
+      return res.status(200).json({
+        status: true,
+        category: result
+      });
     } else {
-        res.json({
-            status: false
-        });
+      return res.status(404).json({
+        status: false,
+        message: "Category not found"
+      });
     }
+  } catch (err) {
+    next(err);
+  }
+});
 
+// Admin: Delete Category
+app.post("/deletecategory", authMiddleware, adminMiddleware, async (req, res, next) => {
+  try {
+    const catId = req.body.dltcat?._id || req.body._id;
+    const result = await mycategory.findByIdAndDelete(catId);
 
-
-})
-
-
-
-// all users/ Customers  :------------
-app.get("/allusers", async (req, res) => {
-    let a = await myusers.find().sort({ _id: -1 });
-    if (a) {
-        res.json({
-            status: true,
-            myallusers: a
-        })
-    }
-    else {
-        res.json({
-            status: false
-        })
-    }
-
-})
-
-
-// forgetpassword--------------------
-
-
-app.post("/forgetpass", async (req, res) => {
-    let a = await myusers.findOneAndUpdate({ "email": req.body.forgetpass.email }, { $set: { "password": req.body.forgetpass.password } })
-    if (a) {
-        res.json({
-            status: true,
-            myallusers: a
-        })
-    }
-    else {
-        res.json({
-            status: false
-        })
-    }
-})
-
-
-// Category page ------------------------
-app.post("/category", async (req, res) => {
-    let b = req.body.categoryvalue
-    let a = await mycategory.insertOne({
-        image: b.image,
-        categoryName: b.categoryName,
-        slug: b.slug,
-        date: b.date,
-        Description: b.Description,
-        Category: b.Category,
-        status: b.status,
-        metaTitle: b.metaTitle,
-        MetaDescription: b.MetaDescription,
-    })
-
-
-    let result = await a.save()
     if (result) {
-        res.json({
-            status: true
-        })
+      return res.status(200).json({ status: true });
+    } else {
+      return res.status(404).json({
+        status: false,
+        message: "Category not found"
+      });
     }
-    else {
-        res.json({
-            status: false
-        })
-    }
-})
+  } catch (err) {
+    next(err);
+  }
+});
 
-app.get("/AllCategory", async (req, res) => {
-    let a = await mycategory.find().sort({ _id: -1 });
+// ==========================================
+// Product Management Routes
+// ==========================================
 
-    if (a) {
-        res.json({
-            status: true,
-            myallcategory: a
-        })
-    }
-    else {
-        res.json({
-            status: false
-        })
-    }
+// Admin: Add Product
+app.post("/product", authMiddleware, adminMiddleware, async (req, res, next) => {
+  try {
+    const b = req.body.productvalue || req.body;
+    const productDoc = new myproducts({
+      Title: b.Title,
+      Category: b.Category,
+      Weight: b.Weight,
+      Unit: b.Unit,
+      image: b.image,
+      Description: b.Description,
+      ProductCode: b.ProductCode,
+      ProductSKU: b.ProductSKU,
+      status: b.status,
+      RegularPrice: b.RegularPrice,
+      SalePrice: b.SalePrice,
+      MetaTitle: b.MetaTitle,
+      MetaDescription: b.MetaDescription,
+      vendorId: b.vendorId,
+      vendorName: b.vendorName
+    });
 
-})
+    const result = await productDoc.save();
+    return res.status(201).json({
+      status: true,
+      product: result
+    });
+  } catch (err) {
+    next(err);
+  }
+});
 
+// Public: Get All Products
+app.get("/allproduct", async (req, res, next) => {
+  try {
+    const a = await myproducts.find().sort({ _id: -1 });
+    return res.status(200).json({
+      status: true,
+      myallproduct: a
+    });
+  } catch (err) {
+    next(err);
+  }
+});
 
-
-// product page -------------------------------
-app.post("/product", async (req, res) => {
-    let b = req.body.productvalue
-    let a = await myproducts.insertOne({
+// Admin: Update Product
+app.post("/updateproduct", authMiddleware, adminMiddleware, async (req, res, next) => {
+  try {
+    const b = req.body.productvalue || req.body;
+    const result = await myproducts.findByIdAndUpdate(
+      b._id,
+      {
         Title: b.Title,
         Category: b.Category,
         Weight: b.Weight,
@@ -296,1216 +632,896 @@ app.post("/product", async (req, res) => {
         MetaTitle: b.MetaTitle,
         MetaDescription: b.MetaDescription,
         vendorId: b.vendorId,
-
         vendorName: b.vendorName
-    })
-
-
-    let result = await a.save()
-    if (result) {
-        res.json({
-            status: true
-        })
-    }
-    else {
-        res.json({
-            status: false
-        })
-    }
-
-})
-app.get("/allproduct", async (req, res) => {
-
-    let a = await myproducts.find().sort({ _id: -1 });
-
-    if (a) {
-        res.json({
-            status: true,
-            myallproduct: a
-        });
-    } else {
-        res.json({
-            status: false
-        });
-    }
-
-});
-
-// update product --------------
-
-app.post("/updateproduct", async (req, res) => {
-
-    let b = req.body.productvalue
-
-
-    let result = await myproducts.findByIdAndUpdate(
-        b._id,
-        {
-            Title: b.Title,
-            Category: b.Category,
-            Weight: b.Weight,
-            Unit: b.Unit,
-            image: b.image,
-            Description: b.Description,
-            ProductCode: b.ProductCode,
-            ProductSKU: b.ProductSKU,
-            status: b.status,
-            RegularPrice: b.RegularPrice,
-            SalePrice: b.SalePrice,
-            MetaTitle: b.MetaTitle,
-            MetaDescription: b.MetaDescription,
-            vendorId: b.vendorId,
-
-            vendorName: b.vendorName
-        }
+      },
+      { new: true }
     );
 
     if (result) {
-        res.json({ status: true });
+      return res.status(200).json({ status: true, product: result });
     } else {
-        res.json({ status: false });
+      return res.status(404).json({ status: false, message: "Product not found" });
     }
+  } catch (err) {
+    next(err);
+  }
 });
 
-// category update 
-
-app.post("/updatecategory", async (req, res) => {
-
-    let b = req.body.categoryvalue
-
-    let result = await mycategory.findOneAndUpdate(
-        { "_id": b._id }, {
-        $set:
-        {
-            image: b.image,
-            categoryName: b.categoryName,
-            slug: b.slug,
-            date: b.date,
-            Description: b.Description,
-            Category: b.Category,
-            status: b.status,
-            metaTitle: b.metaTitle,
-            MetaDescription: b.MetaDescription
-        }
-    }
-    );
+// Admin: Delete Product
+app.post("/deleteproduct", authMiddleware, adminMiddleware, async (req, res, next) => {
+  try {
+    const proId = req.body.dltpro?._id || req.body._id;
+    const result = await myproducts.findByIdAndDelete(proId);
 
     if (result) {
-        res.json({
-            status: true
-        });
+      return res.status(200).json({ status: true });
     } else {
-        res.json({
-            status: false
-        });
+      return res.status(404).json({ status: false, message: "Product not found" });
     }
-
+  } catch (err) {
+    next(err);
+  }
 });
 
+// Public: Search Products (with safe regex escaping)
+app.get("/searchproduct", async (req, res, next) => {
+  try {
+    const keyword = (req.query.keyword || "").toString();
+    const safeKeyword = keyword.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
-
-// delete product =========
-app.post("/deleteproduct", async (req, res) => {
-    let result = await myproducts.findOneAndDelete({ "_id": req.body.dltpro._id })
-    if (result) {
-        res.json({
-            status: true
-        })
-    }
-    else {
-        res.json({
-            status: false
-        })
-    }
-})
-
-
-// delete category---------------------
-app.post("/deletecategory", async (req, res) => {
-    let result = await mycategory.findOneAndDelete({ "_id": req.body.dltcat._id })
-    if (result) {
-        res.json({
-            status: true
-        })
-    }
-    else {
-        res.json({
-            status: false
-        })
-    }
-})
-
-
-// delete customer ______________________=--------
-
-app.post("/deletecustomer", async (req, res) => {
-    let result = await myusers.findOneAndDelete({ "_id": req.body.dltcus._id })
-    if (result) {
-        res.json({
-            status: true
-        })
-    }
-    else {
-        res.json({
-            status: false
-        })
-    }
-})
-
-
-// address-------------------
-app.post("/addaddress", async (req, res) => {
-
-    let b = req.body.addressdata;
-
-    let result = await myaddress.insertOne({
-
-        userid: b.userid,
-
-        FirstName: b.FirstName,
-
-        LastName: b.LastName,
-
-        AddressLine1: b.AddressLine1,
-
-        AddressLine2: b.AddressLine2,
-
-        City: b.City,
-
-        Country: b.Country,
-
-        State: b.State,
-
-        ZipCode: b.ZipCode,
-
-        BusinessName: b.BusinessName,
-
-        IsDefault: b.IsDefault
-
+    const products = await myproducts.find({
+      Title: {
+        $regex: safeKeyword,
+        $options: "i"
+      }
     });
 
-    let save = await result.save();
-
-    if (save) {
-
-        res.json({
-            status: true
-        });
-
-    } else {
-
-        res.json({
-            status: false
-        });
-
-    }
-
+    return res.status(200).json({
+      status: true,
+      products: products
+    });
+  } catch (err) {
+    next(err);
+  }
 });
 
-app.post("/getaddress", async (req, res) => {
+// ==========================================
+// Address Management Routes
+// ==========================================
 
-    let result = await myaddress.find({
+// Add Address
+app.post("/addaddress", authMiddleware, async (req, res, next) => {
+  try {
+    const b = req.body.addressdata || req.body;
+    const userId = req.user._id.toString();
 
-        userid: req.body.userId
+    if (b.IsDefault) {
+      await myaddress.updateMany(
+        { userid: userId },
+        { $set: { IsDefault: false } }
+      );
+    }
 
+    const addressDoc = new myaddress({
+      userid: userId,
+      FirstName: b.FirstName,
+      LastName: b.LastName,
+      AddressLine1: b.AddressLine1,
+      AddressLine2: b.AddressLine2,
+      City: b.City,
+      Country: b.Country,
+      State: b.State,
+      ZipCode: b.ZipCode,
+      BusinessName: b.BusinessName,
+      IsDefault: Boolean(b.IsDefault)
     });
 
-    if (result) {
-
-        res.json({
-
-            status: true,
-
-            addresses: result
-
-        });
-
-    }
-    else {
-
-        res.json({
-
-            status: false
-
-        });
-
-    }
-
+    const saved = await addressDoc.save();
+    return res.status(201).json({
+      status: true,
+      address: saved
+    });
+  } catch (err) {
+    next(err);
+  }
 });
 
+// Get Addresses for logged-in user
+app.post("/getaddress", authMiddleware, async (req, res, next) => {
+  try {
+    const userId = req.user._id.toString();
+    const result = await myaddress.find({ userid: userId });
 
-app.post("/setdefaultaddress", async (req, res) => {
+    return res.status(200).json({
+      status: true,
+      addresses: result
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Set Default Address
+app.post("/setdefaultaddress", authMiddleware, async (req, res, next) => {
+  try {
+    const { addressId } = req.body;
+    const userId = req.user._id.toString();
+
+    if (!addressId) {
+      return res.status(400).json({
+        status: false,
+        message: "Address ID is required"
+      });
+    }
+
+    // Verify address belongs to the logged-in user
+    const address = await myaddress.findOne({ _id: addressId, userid: userId });
+    if (!address) {
+      return res.status(404).json({
+        status: false,
+        message: "Address not found or unauthorized"
+      });
+    }
 
     await myaddress.updateMany(
-
-        { userid: req.body.userId },
-
-        {
-
-            $set: {
-
-                IsDefault: false
-
-            }
-
-        }
-
+      { userid: userId },
+      { $set: { IsDefault: false } }
     );
 
-    await myaddress.findByIdAndUpdate(
-
-        req.body.addressId,
-
-        {
-
-            IsDefault: true
-
-        }
-
-    );
-
-    res.json({
-
-        status: true
-
+    await myaddress.findByIdAndUpdate(addressId, {
+      IsDefault: true
     });
 
+    return res.status(200).json({
+      status: true
+    });
+  } catch (err) {
+    next(err);
+  }
 });
 
+// Delete Address
+app.post("/deleteaddress", authMiddleware, async (req, res, next) => {
+  try {
+    const addressId = req.body._id;
+    const userId = req.user._id.toString();
 
-// delete address ----------------
+    const query = req.user.isAdmin
+      ? { _id: addressId }
+      : { _id: addressId, userid: userId };
 
-app.post("/deleteaddress", async (req, res) => {
+    const result = await myaddress.findOneAndDelete(query);
 
-    let result = await myaddress.findOneAndDelete({
+    if (result) {
+      return res.status(200).json({ status: true });
+    } else {
+      return res.status(404).json({
+        status: false,
+        message: "Address not found"
+      });
+    }
+  } catch (err) {
+    next(err);
+  }
+});
 
-        _id: req.body._id
+// ==========================================
+// Cart Management Routes
+// ==========================================
 
+// Add To Cart
+app.post("/addtocart", authMiddleware, async (req, res, next) => {
+  try {
+    const product = req.body;
+    const userEmail = req.user.email;
+    const productId = product.productId || product._id;
+
+    if (!productId) {
+      return res.status(400).json({
+        status: false,
+        message: "Product ID is required"
+      });
+    }
+
+    const already = await mycart.findOne({
+      productId: productId,
+      email: userEmail
+    });
+
+    if (already) {
+      return res.status(200).json({
+        status: false,
+        message: "Already Added"
+      });
+    }
+
+    const cart = new mycart({
+      productId: productId,
+      email: userEmail,
+      Title: product.Title,
+      Category: product.Category,
+      image: product.image,
+      Weight: product.Weight,
+      SalePrice: Number(product.SalePrice) || 0,
+      RegularPrice: Number(product.RegularPrice) || 0,
+      quantity: Number(product.quantity) || 1
+    });
+
+    await cart.save();
+    return res.status(201).json({ status: true });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Get Cart Items (supports both POST and GET)
+const getCartHandler = async (req, res, next) => {
+  try {
+    const userEmail = req.user.email;
+    const data = await mycart.find({ email: userEmail });
+
+    return res.status(200).json({
+      status: true,
+      mycart: data
+    });
+  } catch (err) {
+    next(err);
+  }
+};
+
+app.post("/cart", authMiddleware, getCartHandler);
+app.get("/cart", authMiddleware, getCartHandler);
+
+// Delete Single Cart Item
+app.post("/deleteshopcart", authMiddleware, async (req, res, next) => {
+  try {
+    const userEmail = req.user.email;
+    const result = await mycart.findOneAndDelete({
+      _id: req.body._id,
+      email: userEmail
     });
 
     if (result) {
-
-        res.json({
-
-            status: true
-
-        });
-
-    }
-    else {
-
-        res.json({
-
-            status: false
-
-        });
-
-    }
-
-});
-
-
-//add to cart ---------------------------------
-// Add To Cart
-app.post("/addtocart", async (req, res) => {
-    try {
-        let product = req.body;
-
-        // ✅ Check by productId + email/userId
-        let already = await mycart.findOne({
-            productId: product._id,
-            email: product.email // Ensure email is sent from frontend
-        });
-
-        if (already) {
-            return res.json({
-                status: false,
-                message: "Already Added"
-            });
-        }
-
-        let cart = new mycart({
-            productId: product._id,
-            email: product.email,
-            Title: product.Title,
-            Category: product.Category,
-            image: product.image,
-            Weight: product.Weight,
-            SalePrice: product.SalePrice,
-            RegularPrice: product.RegularPrice,
-            quantity: 1
-        });
-
-        await cart.save();
-
-        res.json({ status: true });
-    } catch (err) {
-        res.json({ status: false, message: err.message });
-    }
-});
-
-
-app.get("/cart", async (req, res) => {
-
-    let data = await mycart.find();
-
-    res.json({
-
+      return res.status(200).json({
         status: true,
+        message: "Product removed from cart"
+      });
+    } else {
+      return res.status(404).json({
+        status: false,
+        message: "Product not found"
+      });
+    }
+  } catch (err) {
+    next(err);
+  }
+});
 
-        mycart: data
-
+// Delete Cart Item (Alternate Endpoint)
+app.post("/deletecart", authMiddleware, async (req, res, next) => {
+  try {
+    const userEmail = req.user.email;
+    const result = await mycart.findOneAndDelete({
+      _id: req.body._id,
+      email: userEmail
     });
 
-});
-
-app.post("/deleteshopcart", async (req, res) => {
-    try {
-        let result = await mycart.findOneAndDelete({
-            _id: req.body._id,
-        });
-
-        if (result) {
-            res.json({
-                status: true,
-                message: "Product removed from cart",
-            });
-        } else {
-            res.json({
-                status: false,
-                message: "Product not found",
-            });
-        }
-    } catch (err) {
-        res.json({
-            status: false,
-            message: err.message,
-        });
+    if (result) {
+      return res.status(200).json({ status: true });
+    } else {
+      return res.status(404).json({ status: false });
     }
+  } catch (err) {
+    next(err);
+  }
 });
 
-// Wishlist Page ------------------
-const mywishlist = require("./model/Wishlist");
+// Cart Total Quantity Count
+app.post("/cartcount", authMiddleware, async (req, res, next) => {
+  try {
+    const email = req.user?.email || req.body.email;
+    if (!email) {
+      return res.status(200).json({ status: false, count: 0 });
+    }
+
+    const result = await mycart.aggregate([
+      { $match: { email: email } },
+      { $group: { _id: null, totalQty: { $sum: "$quantity" } } }
+    ]);
+
+    const total = result.length > 0 ? result[0].totalQty : 0;
+    return res.status(200).json({
+      status: true,
+      count: total
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ==========================================
+// Wishlist Management Routes
+// ==========================================
 
 // Add to Wishlist
-app.post("/addwishlist", async (req, res) => {
-    try {
-        let product = req.body;
+app.post("/addwishlist", authMiddleware, async (req, res, next) => {
+  try {
+    const product = req.body;
+    const userEmail = req.user.email;
+    const productId = product.productId || product._id;
 
-        // ✅ FIX: email aur productId DONO se check karein
-        let already = await mywishlist.findOne({
-            productId: product._id,
-            email: product.email
-        });
-
-        if (already) {
-            return res.json({
-                status: false,
-                msg: "Already Added"
-            });
-        }
-
-        // ✅ FIX: Standard Mongoose creation method
-        let wishlist = new mywishlist({
-            productId: product._id,
-            Title: product.Title,
-            Category: product.Category,
-            Weight: product.Weight,
-            image: product.image,
-            SalePrice: product.SalePrice,
-            RegularPrice: product.RegularPrice,
-            email: product.email,
-            status: product.status
-        });
-
-        await wishlist.save();
-
-        res.json({
-            status: true
-        });
-    } catch (err) {
-        res.json({
-            status: false,
-            msg: err.message
-        });
+    if (!productId) {
+      return res.status(400).json({
+        status: false,
+        msg: "Product ID is required"
+      });
     }
+
+    const already = await mywishlist.findOne({
+      productId: productId,
+      email: userEmail
+    });
+
+    if (already) {
+      return res.status(200).json({
+        status: false,
+        msg: "Already Added"
+      });
+    }
+
+    const wishlist = new mywishlist({
+      productId: productId,
+      Title: product.Title,
+      Category: product.Category,
+      Weight: product.Weight,
+      image: product.image,
+      SalePrice: Number(product.SalePrice) || 0,
+      RegularPrice: Number(product.RegularPrice) || 0,
+      email: userEmail,
+      status: product.status || ""
+    });
+
+    await wishlist.save();
+    return res.status(201).json({ status: true });
+  } catch (err) {
+    next(err);
+  }
 });
 
-// Get User Specific Wishlist
-app.post("/wishlist", async (req, res) => {
-    try {
-        let result = await mywishlist.find({ email: req.body.email });
-        res.json({
-            status: true,
-            mywishlist: result
-        });
-    } catch (err) {
-        res.json({
-            status: false,
-            msg: err.message
-        });
-    }
+// Get User Wishlist
+app.post("/wishlist", authMiddleware, async (req, res, next) => {
+  try {
+    const userEmail = req.user.email;
+    const result = await mywishlist.find({ email: userEmail });
+
+    return res.status(200).json({
+      status: true,
+      mywishlist: result
+    });
+  } catch (err) {
+    next(err);
+  }
 });
 
 // Delete Wishlist Item
-app.post("/deletewishlist", async (req, res) => {
-    try {
-        let result = await mywishlist.findOneAndDelete({
-            _id: req.body._id,
-            email: req.body.email
-        });
-
-        if (result) {
-            res.json({ status: true });
-        } else {
-            res.json({ status: false });
-        }
-    } catch (err) {
-        res.json({ status: false });
-    }
-});
-
-// ✅ FIX: Wishlist Count (Filtered by User Email)
-app.post("/wishlistcount", async (req, res) => {
-    try {
-        let count = await mywishlist.countDocuments({ email: req.body.email });
-        res.json({
-            status: true,
-            count: count
-        });
-    } catch (err) {
-        res.json({ status: false, count: 0 });
-    }
-});
-// navbar----------------------------
-
-// cart count
-
-
-// ✅ Cart Count (Filtered by Logged-in User)
-app.post("/cartcount", async (req, res) => {
-    try {
-        const { email } = req.body;
-
-        if (!email) {
-            return res.json({ status: false, count: 0 });
-        }
-
-        // Distinct items count
-        let count = await mycart.countDocuments({ email: email });
-
-        res.json({
-            status: true,
-            count: count
-        });
-    } catch (err) {
-        res.json({ status: false, count: 0 });
-    }
-});
-
-// ✅ Delete Cart Item (With User Verification)
-app.post("/deletecart", async (req, res) => {
-    try {
-        let result = await mycart.findOneAndDelete({
-            _id: req.body._id,
-            email: req.body.email
-        });
-
-        if (result) {
-            res.json({ status: true });
-        } else {
-            res.json({ status: false });
-        }
-    } catch (err) {
-        res.json({ status: false });
-    }
-});
-
-
-// Alternative: Agar Total Quantity sum karke dikhani ho
-app.post("/cartcount", async (req, res) => {
-    try {
-        const { email } = req.body;
-        const result = await mycart.aggregate([
-            { $match: { email: email } },
-            { $group: { _id: null, totalQty: { $sum: "$quantity" } } }
-        ]);
-
-        let total = result.length > 0 ? result[0].totalQty : 0;
-        res.json({ status: true, count: total });
-    } catch (err) {
-        res.json({ status: false, count: 0 });
-    }
-});
-
-
-// Reviews---------------------------------------------
-const myreview = require("./model/Review");
-
-
-app.post("/addreview", async (req, res) => {
-
-    try {
-
-        let b = req.body;
-
-        let product = await myproducts.findById(b.productId);
-
-
-        let a = await myreview.insertOne({
-
-            productId: b.productId,
-
-            productName: product ? product.Title : "Unknown Product",
-
-            name: b.name,
-
-            email: b.email,
-
-            rating: Number(b.rating),
-
-            review: b.review
-
-        });
-
-
-        let result = await a.save();
-
-
-        res.json({
-
-            status: true
-
-        });
-
-
-    }
-    catch (err) {
-
-        console.log(err);
-
-        res.json({
-
-            status: false,
-
-            error: err.message
-
-        });
-
-    }
-
-});
-
-app.post("/getreview", async (req, res) => {
-
-    let result = await myreview.find({
-
-        productId: req.body.productId
-
+app.post("/deletewishlist", authMiddleware, async (req, res, next) => {
+  try {
+    const userEmail = req.user.email;
+    const result = await mywishlist.findOneAndDelete({
+      _id: req.body._id,
+      email: userEmail
     });
 
     if (result) {
-
-        res.json({
-
-            status: true,
-
-            myreview: result
-
-        });
-
+      return res.status(200).json({ status: true });
+    } else {
+      return res.status(404).json({ status: false });
     }
-
-    else {
-
-        res.json({
-
-            status: false
-
-        });
-
-    }
-
+  } catch (err) {
+    next(err);
+  }
 });
 
-// delete review ------------------
+// Wishlist Count
+app.post("/wishlistcount", authMiddleware, async (req, res, next) => {
+  try {
+    const userEmail = req.user.email;
+    const count = await mywishlist.countDocuments({ email: userEmail });
 
-app.post("/deletereview", async (req, res) => {
+    return res.status(200).json({
+      status: true,
+      count: count
+    });
+  } catch (err) {
+    next(err);
+  }
+});
 
-    let id = req.body.id;
+// ==========================================
+// Review Management Routes
+// ==========================================
 
-    let result = await myreview.findOneAndDelete(
+// Add Product Review
+app.post("/addreview", authMiddleware, async (req, res, next) => {
+  try {
+    const b = req.body;
+    const product = await myproducts.findById(b.productId);
 
-        { "_id": id }
+    const reviewDoc = new myreview({
+      productId: b.productId,
+      productName: product ? product.Title : b.productName || "Unknown Product",
+      name: b.name || `${req.user.firstname} ${req.user.lastname}`.trim(),
+      email: req.user.email,
+      rating: Number(b.rating) || 0,
+      review: b.review || ""
+    });
 
+    await reviewDoc.save();
+    return res.status(201).json({ status: true });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Public: Get Reviews by Product ID
+app.post("/getreview", async (req, res, next) => {
+  try {
+    const result = await myreview.find({
+      productId: req.body.productId
+    });
+
+    return res.status(200).json({
+      status: true,
+      myreview: result
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Admin: Delete Review
+app.post("/deletereview", authMiddleware, adminMiddleware, async (req, res, next) => {
+  try {
+    const id = req.body.id || req.body._id;
+    const result = await myreview.findByIdAndDelete(id);
+
+    if (result) {
+      return res.status(200).json({ status: true });
+    } else {
+      return res.status(404).json({
+        status: false,
+        message: "Review not found"
+      });
+    }
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Update Review
+app.post("/updatereview", authMiddleware, async (req, res, next) => {
+  try {
+    const b = req.body;
+    const query = req.user.isAdmin
+      ? { _id: b._id }
+      : { _id: b._id, email: req.user.email };
+
+    const updateFields = {};
+    if (b.name !== undefined) updateFields.name = b.name;
+    if (b.rating !== undefined) updateFields.rating = Number(b.rating);
+    if (b.review !== undefined) updateFields.review = b.review;
+
+    const result = await myreview.findOneAndUpdate(
+      query,
+      { $set: updateFields },
+      { new: true }
     );
 
     if (result) {
-
-        res.json({
-            status: true
-        });
-
-    } else {
-
-        res.json({
-            status: false
-        });
-
-    }
-
-});
-
-// update review -----------------------------------------
-app.post("/updatereview", async (req, res) => {
-
-    let b = req.body;
-
-    let result = await myreview.findOneAndUpdate(
-
-        { "_id": b._id },
-
-        {
-            $set: {
-
-                name: b.name,
-                email: b.email,
-                rating: b.rating,
-                review: b.review
-
-            }
-
-        }
-
-    );
-
-    if (result) {
-
-        res.json({
-            status: true
-        });
-
-    } else {
-
-        res.json({
-            status: false
-        });
-
-    }
-
-});
-
-
-// dashboard all reviews --------------------------
-
-app.get("/allreviews", async (req, res) => {
-
-    let a = await myreview.find().sort({ _id: -1 });
-
-    if (a) {
-
-        res.json({
-
-            status: true,
-
-            myallreviews: a
-
-        });
-
-    }
-    else {
-
-        res.json({
-
-            status: false
-
-        });
-
-    }
-
-});
-
-// add payment ---------------------
-
-const mypayment = require("./model/Payment");
-
-app.post("/addpayment", async (req, res) => {
-
-    let b = req.body;
-
-    let result = await mypayment.insertOne({
-
-        userId: b.userId,
-
-        cardType: b.cardType,
-
-        cardName: b.cardName,
-
-        cardNumber: b.cardNumber,
-
-        month: b.month,
-
-        year: b.year,
-
-        cvv: b.cvv
-
-    });
-
-    await result.save();
-
-    res.json({
-        status: true
-    });
-
-});
-
-
-app.post("/getpayment", async (req, res) => {
-
-    let result = await mypayment.find({
-
-        userId: req.body.userId
-
-    });
-
-    res.json({
-
+      return res.status(200).json({
         status: true,
-
-        payment: result
-
-    });
-
-});
-
-
-app.post("/deletepayment", async (req, res) => {
-
-    let result = await mypayment.findOneAndDelete({
-
-        _id: req.body._id
-
-    });
-
-    if (result) {
-
-        res.json({
-            status: true
-        });
-
-    }
-    else {
-
-        res.json({
-            status: false
-        });
-
-    }
-
-});
-
-
-// your order page------------------
-const myorder = require("./model/Order");
-
-
-// Add Order
-app.post("/addorder", async (req, res) => {
-    //  console.log(req.body.products);
-
-    let result = await myorder.insertMany(req.body.products);
-
-    if (result) {
-
-        await mycart.deleteMany({});
-
-        res.json({
-            status: true
-        });
-
-    }
-    else {
-
-        res.json({
-            status: false
-        });
-
-    }
-
-});
-
-
-// Admin Order List (All Orders)
-app.get("/orders", async (req, res) => {
-
-    let result = await myorder.find().sort({ _id: -1 });
-
-
-    if (result) {
-
-        res.json({
-
-            status: true,
-
-            myorders: result
-
-        });
-
-    }
-    else {
-
-        res.json({
-
-            status: false
-
-        });
-
-    }
-
-});
-
-
-// User Orders (Only Logged In User)
-app.post("/myorders", async (req, res) => {
-
-    let result = await myorder.find({
-
-        userId: req.body.userId
-
-    });
-
-    if (result) {
-
-        res.json({
-
-            status: true,
-
-            myorders: result
-
-        });
-
+        review: result
+      });
     } else {
-
-        res.json({
-
-            status: false
-
-        });
-
+      return res.status(404).json({
+        status: false,
+        message: "Review not found or unauthorized"
+      });
     }
-
+  } catch (err) {
+    next(err);
+  }
 });
 
-
-// single order list -----------------
-app.post("/ordersingle", async (req, res) => {
-
-    let result = await myorder.find({
-
-        orderNo: req.body.orderNo
-
+// Admin: Get All Reviews
+app.get("/allreviews", authMiddleware, adminMiddleware, async (req, res, next) => {
+  try {
+    const a = await myreview.find().sort({ _id: -1 });
+    return res.status(200).json({
+      status: true,
+      myallreviews: a
     });
-
-    if (result) {
-
-        res.json({
-
-            status: true,
-
-            order: result
-
-        });
-
-    }
-
-    else {
-
-        res.json({
-
-            status: false
-
-        });
-
-    }
-
+  } catch (err) {
+    next(err);
+  }
 });
 
-// update order status----------
-app.post("/updateorderstatus", async (req, res) => {
+// ==========================================
+// Payment Routes (PCI-DSS Compliant)
+// ==========================================
 
-    let result = await myorder.updateMany(
+// Direct payment card storage is disabled for PCI-DSS compliance.
+app.post("/getpayment", authMiddleware, (req, res) => {
+  return res.status(200).json({
+    status: false,
+    message: "Card storage is disabled. Use Razorpay saved cards."
+  });
+});
 
-        {
-            orderNo: req.body.orderNo
-        },
+app.post("/deletepayment", authMiddleware, (req, res) => {
+  return res.status(200).json({
+    status: false,
+    message: "Card storage is disabled. Use Razorpay saved cards."
+  });
+});
 
-        {
-            $set: {
-                status: req.body.status
-            }
-        }
+// Razorpay Order Creation Endpoint
+// NOTE: Production implementation requires the 'razorpay' npm package and environment variables:
+// RAZORPAY_KEY_ID and RAZORPAY_KEY_SECRET.
+// const Razorpay = require('razorpay');
+// const instance = new Razorpay({ key_id: process.env.RAZORPAY_KEY_ID, key_secret: process.env.RAZORPAY_KEY_SECRET });
+app.post("/createrazorpayorder", authMiddleware, async (req, res, next) => {
+  try {
+    const { amount, currency } = req.body;
 
+    if (!amount || isNaN(amount) || Number(amount) <= 0) {
+      return res.status(400).json({
+        status: false,
+        message: "A valid positive amount is required"
+      });
+    }
+
+    const mockOrderId =
+      "order_" + Date.now() + Math.random().toString(36).substr(2, 4);
+
+    return res.status(200).json({
+      status: true,
+      orderId: mockOrderId,
+      amount: Number(amount),
+      currency: currency || "INR"
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ==========================================
+// Order Management Routes
+// ==========================================
+
+// Add New Order
+app.post("/addorder", authMiddleware, async (req, res, next) => {
+  try {
+    const userEmail = req.user.email;
+    const userId = req.user._id.toString();
+
+    let rawProducts = req.body.products;
+    if (!rawProducts) {
+      rawProducts = [req.body];
+    } else if (!Array.isArray(rawProducts)) {
+      rawProducts = [rawProducts];
+    }
+
+    if (rawProducts.length === 0) {
+      return res.status(400).json({
+        status: false,
+        message: "No products provided for order"
+      });
+    }
+
+    // Generate secure order number server-side
+    const serverOrderNo =
+      "#" +
+      Date.now().toString(36).toUpperCase() +
+      Math.random().toString(36).substr(2, 4).toUpperCase();
+    const orderDate = new Date().toISOString();
+
+    const orderDocuments = rawProducts.map((p) => ({
+      userId: userId,
+      customerName:
+        p.customerName || `${req.user.firstname} ${req.user.lastname}`.trim(),
+      email: userEmail,
+      phone: p.phone || req.user.phone || "",
+      address: p.address || "",
+      city: p.city || "",
+      state: p.state || "",
+      country: p.country || "",
+      zipCode: p.zipCode || "",
+      productId: p.productId || p._id || "",
+      Title: p.Title || "",
+      image: p.image || "",
+      Weight: p.Weight || "",
+      SalePrice: Number(p.SalePrice) || 0,
+      quantity: Number(p.quantity) || 1,
+      orderNo: p.orderNo || serverOrderNo,
+      date: p.date || orderDate,
+      status: p.status || "Pending"
+    }));
+
+    const result = await myorder.insertMany(orderDocuments);
+
+    if (result && result.length > 0) {
+      // Delete ONLY the ordering user's cart
+      await mycart.deleteMany({ email: userEmail });
+
+      return res.status(201).json({
+        status: true,
+        orderNo: serverOrderNo,
+        orders: result
+      });
+    } else {
+      return res.status(500).json({
+        status: false,
+        message: "Failed to place order"
+      });
+    }
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Admin: Get All Orders
+app.get("/orders", authMiddleware, adminMiddleware, async (req, res, next) => {
+  try {
+    const result = await myorder.find().sort({ _id: -1 });
+    return res.status(200).json({
+      status: true,
+      myorders: result
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// User Orders (Only Logged-in User)
+app.post("/myorders", authMiddleware, async (req, res, next) => {
+  try {
+    const userId = req.user._id.toString();
+    const userEmail = req.user.email;
+
+    const result = await myorder
+      .find({
+        $or: [{ userId: userId }, { email: userEmail }]
+      })
+      .sort({ _id: -1 });
+
+    return res.status(200).json({
+      status: true,
+      myorders: result
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Single Order Details
+app.post("/ordersingle", authMiddleware, async (req, res, next) => {
+  try {
+    const { orderNo } = req.body;
+    if (!orderNo) {
+      return res.status(400).json({
+        status: false,
+        message: "Order number is required"
+      });
+    }
+
+    const query = req.user.isAdmin
+      ? { orderNo: orderNo }
+      : {
+          orderNo: orderNo,
+          $or: [{ userId: req.user._id.toString() }, { email: req.user.email }]
+        };
+
+    const result = await myorder.find(query);
+
+    return res.status(200).json({
+      status: true,
+      order: result
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Admin: Update Order Status
+app.post("/updateorderstatus", authMiddleware, adminMiddleware, async (req, res, next) => {
+  try {
+    const { orderNo, status } = req.body;
+    if (!orderNo || !status) {
+      return res.status(400).json({
+        status: false,
+        message: "Order number and status are required"
+      });
+    }
+
+    const result = await myorder.updateMany(
+      { orderNo: orderNo },
+      { $set: { status: status } }
     );
 
-    if (result) {
-
-        res.json({
-            status: true
-        });
-
-    }
-    else {
-
-        res.json({
-            status: false
-        });
-
-    }
-
+    return res.status(200).json({
+      status: true,
+      modifiedCount: result.modifiedCount
+    });
+  } catch (err) {
+    next(err);
+  }
 });
 
-// vendor / seller -----------------------
+// ==========================================
+// Vendor / Seller Routes
+// ==========================================
 
-const Vendor = require("./model/Vendor");
-
-// Add Vendor ----------------------------
-
-app.post("/addvendor", async (req, res) => {
-
-    let b = req.body.vendorvalue;
-
-    let a = await Vendor.insertOne({
-
-        vendorName: b.vendorName,
-
-        sellerId: b.sellerId,
-
-        email: b.email,
-
-        phone: b.phone,
-
-        address: b.address,
-
-        image: b.image
-
+// Admin: Add Vendor
+app.post("/addvendor", authMiddleware, adminMiddleware, async (req, res, next) => {
+  try {
+    const b = req.body.vendorvalue || req.body;
+    const vendorDoc = new Vendor({
+      vendorName: b.vendorName,
+      sellerId: b.sellerId,
+      email: b.email,
+      phone: b.phone,
+      address: b.address,
+      image: b.image
     });
 
-    let result = await a.save();
-
-    if (result) {
-
-        res.json({
-
-            status: true
-
-        });
-
-    }
-    else {
-
-        res.json({
-
-            status: false
-
-        });
-
-    }
-
+    const result = await vendorDoc.save();
+    return res.status(201).json({
+      status: true,
+      vendor: result
+    });
+  } catch (err) {
+    next(err);
+  }
 });
 
-// All Vendors --------------------------
-
-app.get("/allvendor", async (req, res) => {
-
-    let a = await Vendor.find();
-
-    if (a) {
-
-        res.json({
-
-            status: true,
-
-            myallvendor: a
-
-        });
-
-    }
-
-    else {
-
-        res.json({
-
-            status: false
-
-        });
-
-    }
-
+// Admin: Get All Vendors
+app.get("/allvendor", authMiddleware, adminMiddleware, async (req, res, next) => {
+  try {
+    const a = await Vendor.find().sort({ _id: -1 });
+    return res.status(200).json({
+      status: true,
+      myallvendor: a
+    });
+  } catch (err) {
+    next(err);
+  }
 });
 
+// Admin: Vendor Dashboard Summary
+app.get("/vendordashboard", authMiddleware, adminMiddleware, async (req, res, next) => {
+  try {
+    const vendors = await Vendor.find();
+    const data = [];
 
-app.get("/vendordashboard", async (req, res) => {
+    for (const vendor of vendors) {
+      const products = await myproducts.find({
+        vendorId: vendor._id.toString()
+      });
 
-    let vendors = await Vendor.find();
+      const productIds = products.map((item) => item._id.toString());
 
-    let data = [];
+      const orders = await myorder.find({
+        productId: { $in: productIds }
+      });
 
-    for (let vendor of vendors) {
+      let grossSale = 0;
+      orders.forEach((item) => {
+        grossSale += (Number(item.SalePrice) || 0) * (Number(item.quantity) || 1);
+      });
 
-        // Vendor ke products
-        let products = await myproducts.find({
-            vendorId: vendor._id.toString()
-        });
+      const earning = Number((grossSale * 0.8).toFixed(2));
 
-        let productIds = products.map((item) => item._id.toString());
-
-        // Vendor ke orders
-        let orders = await myorder.find({
-            productId: { $in: productIds }
-        });
-
-        let grossSale = 0;
-
-        orders.forEach((item) => {
-
-            grossSale += Number(item.SalePrice) * Number(item.quantity);
-
-        });
-
-        let earning = Number((grossSale * 0.80).toFixed(2)); // 80% Vendor
-
-        data.push({
-
-            _id: vendor._id,
-
-            vendorName: vendor.vendorName,
-
-            sellerId: vendor.sellerId,
-
-            email: vendor.email,
-
-            phone: vendor.phone,
-
-            address: vendor.address,
-
-            image: vendor.image,
-
-            totalProducts: products.length,
-
-            totalOrders: orders.length,
-
-            grossSale: grossSale,
-
-            earning: earning
-
-        });
-
+      data.push({
+        _id: vendor._id,
+        vendorName: vendor.vendorName,
+        sellerId: vendor.sellerId,
+        email: vendor.email,
+        phone: vendor.phone,
+        address: vendor.address,
+        image: vendor.image,
+        totalProducts: products.length,
+        totalOrders: orders.length,
+        grossSale: grossSale,
+        earning: earning
+      });
     }
 
-    res.json({
+    return res.status(200).json({
+      status: true,
+      vendors: data
+    });
+  } catch (err) {
+    next(err);
+  }
+});
 
+// Public: Get Vendor by ID
+app.post("/vendorbyid", async (req, res, next) => {
+  try {
+    const vendor = await Vendor.findById(req.body.vendorId);
+    if (vendor) {
+      return res.status(200).json({
         status: true,
-
-        vendors: data
-
-    });
-
+        vendor: vendor
+      });
+    } else {
+      return res.status(404).json({
+        status: false,
+        message: "Vendor not found"
+      });
+    }
+  } catch (err) {
+    next(err);
+  }
 });
 
-
-app.post("/vendorbyid", async (req, res) => {
-
-    let vendor = await Vendor.findById(req.body.vendorId);
+// Admin: Delete Vendor
+app.post("/deletevendor", authMiddleware, adminMiddleware, async (req, res, next) => {
+  try {
+    const id = req.body.id || req.body._id;
+    const vendor = await Vendor.findByIdAndDelete(id);
 
     if (vendor) {
-
-        res.json({
-            status: true,
-            vendor: vendor
-        });
-
+      return res.status(200).json({
+        status: true,
+        message: "Vendor deleted successfully"
+      });
     } else {
-
-        res.json({
-            status: false
-        });
-
+      return res.status(404).json({
+        status: false,
+        message: "Vendor not found"
+      });
     }
-
+  } catch (err) {
+    next(err);
+  }
 });
 
+// ==========================================
+// Base, 404 & Global Error Handling
+// ==========================================
 
-// delete vendor ---------------
-app.post("/deletevendor", async (req, res) => {
-
-    try {
-
-        const { id } = req.body;
-
-        const vendor = await Vendor.findByIdAndDelete(id);
-
-        if (vendor) {
-
-            res.send({
-                status: true,
-                message: "Vendor deleted successfully"
-            });
-
-        }
-        else {
-
-            res.send({
-                status: false,
-                message: "Vendor not found"
-            });
-
-        }
-
-
-    } catch (err) {
-
-        res.send({
-            status: false,
-            message: err.message
-        });
-
-    }
-
-});
-
-// search product -----------------
-
-app.get("/searchproduct", async (req, res) => {
-    try {
-
-        let keyword = req.query.keyword || "";
-
-        let products = await myproducts.find({
-            Title: {
-                $regex: keyword,
-                $options: "i"   // case insensitive
-            }
-        });
-
-        res.json({
-            status: true,
-            products: products
-        });
-
-    } catch (err) {
-
-        res.json({
-            status: false,
-            message: err.message
-        });
-
-    }
-});
-
-// upload ----------------------
-
+// API Health Check
 app.get("/", (req, res) => {
-    res.json({
-        status: true
-    })
-})
+  res.status(200).json({
+    status: true,
+    message: "FreshCart API is running"
+  });
+});
+
+// 404 Route Not Found
+app.use((req, res) => {
+  res.status(404).json({
+    status: false,
+    message: "Route not found"
+  });
+});
+
+// Global Error Handler
+app.use((err, req, res, next) => {
+  console.error(err.stack);
+  res.status(500).json({
+    status: false,
+    message: "Internal server error"
+  });
+});
+
+// ==========================================
+// Start Server
+// ==========================================
+
+const PORT = process.env.PORT || 8080;
+app.listen(PORT, () => {
+  console.log(`FreshCart backend running on port ${PORT}`);
+});
